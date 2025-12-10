@@ -1,8 +1,13 @@
-import os
 import sys
+# This allows the virtual environment to see the system-installed Picamera2/Libcamera
+sys.path.append('/usr/lib/python3/dist-packages')
+# --------------------------
+
+import os
 import argparse
 import glob
 import time
+import re
 
 import cv2
 import numpy as np
@@ -10,7 +15,6 @@ from ultralytics import YOLO
 import easyocr
 
 # Define and parse user input arguments
-
 parser = argparse.ArgumentParser()
 parser.add_argument('--model', help='Path to YOLO model file (example: "runs/detect/train/weights/best.pt")',
                     required=True)
@@ -27,11 +31,14 @@ parser.add_argument('--record', help='Record results from video or webcam and sa
 
 args = parser.parse_args()
 
-
 # Parse user inputs
 model_path = args.model
 img_source = args.source
-min_thresh = args.thresh
+try:
+    min_thresh = float(args.thresh)
+except ValueError:
+    print("Invalid threshold value. Using default 0.7")
+    min_thresh = 0.7
 user_res = args.resolution
 record = args.record
 
@@ -75,6 +82,12 @@ elif 'usb' in img_source:
     usb_idx = int(img_source[3:])
 elif 'picamera' in img_source:
     source_type = 'picamera'
+    # Check if picamera2 is available
+    try:
+        from picamera2 import Picamera2
+    except ImportError:
+        print("Error: 'picamera2' module not found. Ensure you have installed python3-picamera2 via apt.")
+        sys.exit(1)
     picam_idx = int(img_source[8:])
 else:
     print(f'Input {img_source} is invalid. Please try again.')
@@ -111,20 +124,20 @@ elif source_type == 'folder':
         if file_ext in img_ext_list:
             imgs_list.append(file)
 elif source_type == 'video' or source_type == 'usb':
-
     if source_type == 'video': cap_arg = img_source
     elif source_type == 'usb': cap_arg = usb_idx
     cap = cv2.VideoCapture(cap_arg)
-
+    
     # Set camera or video resolution if specified by user
     if user_res:
         ret = cap.set(3, resW)
         ret = cap.set(4, resH)
 
 elif source_type == 'picamera':
-    from picamera2 import Picamera2
     cap = Picamera2()
-    cap.configure(cap.create_video_configuration(main={"format": 'RGB888', "size": (resW, resH)}))
+    # Configure Picamera
+    config = cap.create_video_configuration(main={"format": 'RGB888', "size": (resW, resH)}) if resize else cap.create_video_configuration(main={"format": 'RGB888'})
+    cap.configure(config)
     cap.start()
 
 # Set bounding box colors (using the Tableu 10 color scheme)
@@ -138,13 +151,15 @@ fps_avg_len = 200
 img_count = 0
 
 print("Starting inference loop...")
+
 # Begin inference loop
 while True:
-
     t_start = time.perf_counter()
 
-    # Load frame from image source
-    if source_type == 'image' or source_type == 'folder': # If source is image or image folder, load the image using its filename
+    # --- LOAD FRAME LOGIC ---
+    frame = None
+
+    if source_type == 'image' or source_type == 'folder': 
         if img_count >= len(imgs_list):
             print('All images have been processed. Exiting program.')
             sys.exit(0)
@@ -152,27 +167,37 @@ while True:
         frame = cv2.imread(img_filename)
         img_count = img_count + 1
     
-    elif source_type == 'video': # If source is a video, load next frame from video file
+    elif source_type == 'video': 
         ret, frame = cap.read()
         if not ret:
             print('Reached end of the video file. Exiting program.')
             break
     
-    elif source_type == 'usb': # If source is a USB camera, grab frame from camera
+    elif source_type == 'usb': 
         ret, frame = cap.read()
         if (frame is None) or (not ret):
-            print('Unable to read frames from the camera. This indicates the camera is disconnected or not working. Exiting program.')
+            print('Unable to read frames from the camera. Exiting program.')
             break
 
-    elif source_type == 'picamera': # If source is a Picamera, grab frames using picamera interface
+    elif source_type == 'picamera': 
         frame = cap.capture_array()
-        if (frame is None):
-            print('Unable to read frames from the Picamera. This indicates the camera is disconnected or not working. Exiting program.')
-            break
+        if frame is not None:
+             # Picamera returns RGB, OpenCV expects BGR
+             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+    if frame is None:
+        print('Error: Failed to capture frame. Skipping...')
+        continue
+
+    # Initialize frame dimensions
+    frame_h, frame_w, _ = frame.shape
+    # ----------------------------------------------------
 
     # Resize frame to desired display resolution
     if resize == True:
-        frame = cv2.resize(frame,(resW,resH))
+        frame = cv2.resize(frame, (resW, resH))
+        # Update dimensions after resize
+        frame_h, frame_w, _ = frame.shape
 
     # Run inference on frame
     results = model(frame, verbose=False)
@@ -194,7 +219,7 @@ while True:
             xyxy = detections[i].xyxy.cpu().numpy().squeeze().astype(int)
             xmin, ymin, xmax, ymax = xyxy
             
-            # Ensure coordinates are within frame bounds
+            # Ensure coordinates are within frame bounds (Uses fixed frame_w/frame_h)
             xmin = max(0, xmin)
             ymin = max(0, ymin)
             xmax = min(frame_w, xmax)
@@ -210,16 +235,15 @@ while True:
             try:
                 # Crop the detected plate
                 plate_crop = frame[ymin:ymax, xmin:xmax]
-                # Convert to RGB for EasyOCR
-                # img = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2RGB)
-                gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
-                gray = cv2.GaussianBlur(gray, (1, 1), 10)
-                structuring_element = np.zeros((40, 40), np.uint8)
-                structuring_element[1:-1, 1:-1] = 1
-                final_img = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, structuring_element)
                 
-                # Only run OCR if the crop is valid
+                # Check if crop is valid
                 if plate_crop.size > 0:
+                    gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
+                    gray = cv2.GaussianBlur(gray, (1, 1), 10)
+                    structuring_element = np.zeros((40, 40), np.uint8)
+                    structuring_element[1:-1, 1:-1] = 1
+                    final_img = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, structuring_element)
+                    
                     ocr_results = reader.readtext(final_img, detail=1, allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789')
                     
                     # Iterate through results and check confidence
@@ -231,23 +255,23 @@ while True:
                             
                     ocr_text = ocr_text.strip()
 
-                    # Discard prediction if all characters are not detected
+                    # Discard prediction if text is too short
                     if len(ocr_text) < 6:
                         ocr_text = ""
+                    else:
+                        # --- SAVE LOGIC ---
+                        # Use regex to keep only alphanumeric for safe filename
+                        safe_text = re.sub(r'[^a-zA-Z0-9-]', '', ocr_text)
+                        if safe_text:
+                            # Add a timestamp to prevent overwriting
+                            timestamp = int(time.time())
+                            img_name = os.path.join(save_dir, f'{safe_text}_{timestamp}.jpg')
+                            cv2.imwrite(img_name, final_img)
+                        # --- SAVE LOGIC END ---
 
             except Exception as e:
                 print(f"OCR Error: {e}")
             # --- OCR PROCESSING END ---
-
-            # --- SAVE LOGIC ---
-            if ocr_text:
-                # Use regex to keep only alphanumeric for safe filename
-                safe_text = re.sub(r'[^a-zA-Z0-9-]', '', ocr_text)
-                if safe_text:
-                    # Add a timestamp to prevent overwriting files with the same name
-                    img_name = os.path.join(save_dir, f'{safe_text}_{ocr_prob}.jpg')
-                    cv2.imwrite(img_name, final_img)
-            # --- SAVE LOGIC END ---
 
             # --- DRAWING LOGIC ---
             color = bbox_colors[classidx % 10]
@@ -267,42 +291,40 @@ while True:
             object_count = object_count + 1
             # --- DRAWING LOGIC END ---
 
-    # Calculate and draw framerate (if using video, USB, or Picamera source)
-    if source_type == 'video' or source_type == 'usb' or source_type == 'picamera':
-        cv2.putText(frame, f'FPS: {avg_frame_rate:0.2f}', (10,20), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,255,255), 2) # Draw framerate
+    # Calculate and draw framerate
+    if source_type in ['video', 'usb', 'picamera']:
+        cv2.putText(frame, f'FPS: {avg_frame_rate:0.2f}', (10,20), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,255,255), 2)
     
     # Display detection results
-    cv2.putText(frame, f'Number of objects: {object_count}', (10,40), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,255,255), 2) # Draw total number of detected objects
-    cv2.imshow('YOLO detection results',frame) # Display image
+    cv2.putText(frame, f'Number of objects: {object_count}', (10,40), cv2.FONT_HERSHEY_SIMPLEX, .7, (0,255,255), 2)
+    cv2.imshow('YOLO detection results',frame) 
+    
     if record: recorder.write(frame)
 
-    # If inferencing on individual images, wait for user keypress before moving to next image. Otherwise, wait 5ms before moving to next frame.
-    if source_type == 'image' or source_type == 'folder':
+    # Key press handling
+    if source_type in ['image', 'folder']:
         key = cv2.waitKey()
-    elif source_type == 'video' or source_type == 'usb' or source_type == 'picamera':
+    else:
         key = cv2.waitKey(5)
     
-    if key == ord('q') or key == ord('Q'): # Press 'q' to quit
+    if key == ord('q') or key == ord('Q'): 
         break
-    elif key == ord('s') or key == ord('S'): # Press 's' to pause inference
+    elif key == ord('s') or key == ord('S'): 
         cv2.waitKey()
-    elif key == ord('p') or key == ord('P'): # Press 'p' to save a picture of results on this frame
-        cv2.imwrite('capture.png',frame)
+    elif key == ord('p') or key == ord('P'): 
+        cv2.imwrite('capture.png', frame)
     
-    # Calculate FPS for this frame
+    # Calculate FPS
     t_stop = time.perf_counter()
     frame_rate_calc = float(1/(t_stop - t_start))
 
-    # Append FPS result to frame_rate_buffer (for finding average FPS over multiple frames)
     if len(frame_rate_buffer) >= fps_avg_len:
         temp = frame_rate_buffer.pop(0)
         frame_rate_buffer.append(frame_rate_calc)
     else:
         frame_rate_buffer.append(frame_rate_calc)
 
-    # Calculate average FPS for past frames
     avg_frame_rate = np.mean(frame_rate_buffer)
-
 
 # Clean up
 print(f'Average pipeline FPS: {avg_frame_rate:.2f}')
