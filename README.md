@@ -1,7 +1,7 @@
 # Automatic Number Plate Detection & Reading Using Custom Trained YOLO v11n, EasyOCR on Raspberry Pi5
 
 **Welcome!**  
-This project brings high-speed **Automatic Number Plate Recognition (ANPR)** to the **Raspberry Pi 5**.
+This project brings **Automatic Number Plate Recognition (ANPR)** to the **Raspberry Pi 5**.
 
 ---
 
